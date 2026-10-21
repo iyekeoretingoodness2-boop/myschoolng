@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    // Set this custom claim only for the owner/admin from a trusted server.
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    function isApprovedStudent() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/academyMembers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/academyMembers/$(request.auth.uid)).data.status == 'approved';
+    }
+
+    // Existing MySchoolNG collections: preserved with corrected syntax.
+    match /users/{userId} {
+      allow create: if isSelf(userId);
+      allow read: if isSelf(userId) || isAdmin();
+      // Users must not be able to approve themselves or alter role/payment fields.
+      allow update: if isSelf(userId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['displayName', 'photoURL', 'updatedAt']);
+      allow delete: if isAdmin();
+    }
+
+    match /classes/{classId} {
+      allow read: if true;
+      allow create: if signedIn()
+        && request.resource.data.teacherId == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.teacherId == request.auth.uid
+        && request.resource.data.teacherId == request.auth.uid;
+      allow delete: if isAdmin();
+
+      match /members/{memberId} {
+        allow create: if isSelf(memberId)
+          && exists(/databases/$(database)/documents/classes/$(classId))
+          && request.resource.data.uid == memberId;
+        allow read: if isSelf(memberId)
+          || (signedIn() && get(/databases/$(database)/documents/classes/$(classId)).data.teacherId == request.auth.uid)
+          || isAdmin();
+        allow update: if isSelf(memberId)
+          && request.resource.data.uid == memberId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'updatedAt']);
+        allow delete: if isAdmin();
+      }
+    }
+
+    // Academy: course catalogue descriptions are visible before payment;
+    // lesson content should be stored in Storage under protected paths.
+    match /courses/{courseId} {
+      allow read: if resource.data.isPublished == true || isAdmin();
+      allow create, update, delete: if isAdmin();
+      match /lessons/{lessonId} {
+        allow read: if isApprovedStudent() || isAdmin();
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // Membership status and payment decisions can only be written by admin.
+    match /academyMembers/{uid} {
+      allow read: if isSelf(uid) || isAdmin();
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['uid', 'displayName', 'email', 'status', 'createdAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.status == 'pending';
+      allow update, delete: if isAdmin();
+    }
+
+    match /paymentRequests/{requestId} {
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.amount == 1000;
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    match /conversations/{conversationId} {
+      allow read, create: if signedIn()
+        && request.auth.uid in resource.data.participantUids;
+      allow update: if signedIn()
+        && request.auth.uid in resource.data.participantUids
+        && request.resource.data.participantUids == resource.data.participantUids;
+      allow delete: if isAdmin();
+      match /messages/{messageId} {
+        allow read: if signedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantUids;
+        allow create: if signedIn()
+          && request.resource.data.senderUid == request.auth.uid
+          && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantUids;
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    match /communityMessages/{messageId} {
+      allow read: if isApprovedStudent() || isAdmin();
+      allow create: if isApprovedStudent()
+        && request.resource.data.senderUid == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    match /submissions/{submissionId} {
+      allow create: if isApprovedStudent()
+        && request.resource.data.uid == request.auth.uid;
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Deny every collection not explicitly listed above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
